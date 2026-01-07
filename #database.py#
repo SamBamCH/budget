@@ -1,0 +1,247 @@
+import sqlite3
+import os
+from pathlib import Path
+
+SCHEMA_FILE = os.path.join(os.path.dirname(__file__), "schema.sql")
+
+class BudgetDatabase:
+    def __init__(self, path: str | None = None):
+        self.path = path or self.get_default_db_path()
+        self.connection: sqlite3.Connection | None = None
+
+    @staticmethod
+    def get_default_db_path() -> str:
+        # Simple default: budget.db in project root
+        return str(Path.cwd() / "budget.db")
+
+    def connect(self) -> None:
+        if self.connection is None:
+            self.connection = sqlite3.connect(self.path)
+            self.connection.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        if self.connection:
+            self.connection.close()
+            self.connection = None
+
+    def initialize_schema(self) -> None:
+        """Create all tables using the schema.sql file."""
+        self.connect()
+        with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
+            sql = f.read()
+        self.connection.executescript(sql)
+        self.connection.commit()
+
+    def has_users(self) -> bool:
+        """Check if there is at least one user in the system."""
+        self.connect()
+        cur = self.connection.cursor()
+        cur.execute("SELECT 1 FROM users LIMIT 1")
+        return cur.fetchone() is not None
+
+    # Minimal helpers for later expansion (optional)
+    def create_user(self, username: str, display_name: str | None = None) -> int:
+        self.connect()
+        cur = self.connection.cursor()
+        cur.execute("INSERT INTO users (username, display_name) VALUES (?, ?)", (username, display_name))
+        self.connection.commit()
+        return cur.lastrowid
+    
+    def ensure_schema(self) -> None:
+        """Ensure the DB schema is present; initialize if missing."""
+        self.connect()
+        cur = self.connection.cursor()
+        try:
+            cur.execute("SELECT 1 FROM users LIMIT 1")
+            cur.fetchone()
+        except sqlite3.OperationalError:
+            # Likely schema missing
+            self.initialize_schema()
+    def get_all_users(self):
+        self.connect()
+        cur = self.connection.cursor()
+        cur.execute("SELECT id, username, display_name FROM users")
+        return cur.fetchall()
+
+    def get_user_by_username(self, username: str):
+        self.connect()
+        cur = self.connection.cursor()
+        cur.execute("SELECT id, username, display_name FROM users WHERE username = ?", (username,))
+        return cur.fetchone()
+
+    def create_user(self, username: str, display_name: str | None = None) -> int:
+        self.connect()
+        cur = self.connection.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)", (username, display_name))
+        self.connection.commit()
+        return cur.lastrowid
+    
+    def seed_hierarchy(
+        self,
+        usernames: list[str],
+        l2_by_user: dict[str, dict[str, list[str]]],
+        l3_branches: list[str] | None = None,
+        interactive: bool = True,
+    ) -> None:
+        """
+        Seed a hierarchical account tree with interactive per-L2 prompts.
+
+        - Step 1: ensure type roots (asset, liability, expense, income)
+        - Step 2: for each user, create Level-2 paths: type.username.l2
+        - Step 3: if interactive:
+        for each created L2 path, prompt for Level-3 branches under that L2
+        (if you press Enter, that L2 path is finished)
+        else:
+        apply a common l3_branches list to all L2 paths (backwards-compatible)
+        - Step 4: for each created L3 path, optionally prompt for deeper levels (L4, L5, ...)
+        until the user finishes
+        """
+        if not self.connection:
+            self.connect()
+        cur = self.connection.cursor()
+
+        def ensure_path(path: str, parent: str | None, level: int, display: str, is_leaf: int):
+            row = cur.execute("SELECT 1 FROM account_hierarchy WHERE account_string = ?", (path,)).fetchone()
+            if not row:
+                cur.execute(
+                    "INSERT INTO account_hierarchy (account_string, level, parent_string, display_name, is_leaf) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (path, level, parent, display, is_leaf),
+                )
+            else:
+                if is_leaf == 0 and row[0] == 1:
+                    cur.execute("UPDATE account_hierarchy SET is_leaf = 0 WHERE account_string = ?", (path,))
+        # 1) Ensure type roots
+        for t in ["asset", "liability", "expense", "income"]:
+            if not cur.execute("SELECT 1 FROM account_hierarchy WHERE account_string = ?", (t,)).fetchone():
+                ensure_path(t, None, 1, t, 0)
+
+        # 2) Level-2 per user
+        l2_paths: list[str] = []
+        for user in usernames:
+            user_map = l2_by_user.get(user, {})
+            for t, l2_list in user_map.items():
+                type_user = f"{t}.{user}"
+                for l2 in l2_list:
+                    l2_path = f"{type_user}.{l2}"
+                    row = cur.execute("SELECT is_leaf FROM account_hierarchy WHERE account_string = ?", (l2_path,)).fetchone()
+                    if not row:
+                        ensure_path(l2_path, type_user, 3, l2, 0)
+                    else:
+                        if row[0] == 1:
+                            cur.execute("UPDATE account_hierarchy SET is_leaf = 0 WHERE account_string = ?", (l2_path,))
+                    l2_paths.append(l2_path)
+
+        # 3) Interactive per-L2: prompt for L3 under each L2_path
+        if interactive:
+            for l2_path in l2_paths:
+                l3_raw = input(f"Enter Level-3 branches to apply to {l2_path} (comma-separated) or press Enter to skip: ").strip()
+                if not l3_raw:
+                    continue
+                l3_list = [s.strip() for s in l3_raw.split(",") if s.strip()]
+                created_l3: list[str] = []
+                for l3 in l3_list:
+                    l3_path = f"{l2_path}.{l3}"
+                    r = cur.execute("SELECT is_leaf FROM account_hierarchy WHERE account_string = ?", (l3_path,)).fetchone()
+                    if not r:
+                        level = len(l3_path.split("."))  # asset.user.l2.l3 -> 4
+                        cur.execute(
+                            "INSERT INTO account_hierarchy (account_string, level, parent_string, display_name, is_leaf) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (l3_path, level, l2_path, l3, 0),
+                        )
+                    else:
+                        if r[0] == 1:
+                            cur.execute("UPDATE account_hierarchy SET is_leaf = 0 WHERE account_string = ?", (l3_path,))
+                    created_l3.append(l3_path)
+
+                # 4) For each created L3_path, prompt for deeper levels iteratively
+                for l3_path in created_l3:
+                    frontier = [l3_path]
+                    while frontier:
+                        extra_raw = input(f"Add another level under {frontier[0]}? (comma-separated labels) or press Enter to finish: ").strip()
+                        if not extra_raw:
+                            break
+                        extra_labels = [s.strip() for s in extra_raw.split(",") if s.strip()]
+                        new_frontier: list[str] = []
+                        for base in frontier:
+                            for label in extra_labels:
+                                new_path = f"{base}.{label}"
+                                row = cur.execute("SELECT 1 FROM account_hierarchy WHERE account_string = ?", (new_path,)).fetchone()
+                                if not row:
+                                    lvl = len(new_path.split("."))
+                                    par = base
+                                    cur.execute(
+                                        "INSERT INTO account_hierarchy (account_string, level, parent_string, display_name, is_leaf) "
+                                        "VALUES (?, ?, ?, ?, ?)",
+                                        (new_path, lvl, par, label, 0),
+                                    )
+                                else:
+                                    if row[0] == 1:
+                                        cur.execute("UPDATE account_hierarchy SET is_leaf = 0 WHERE account_string = ?", (new_path,))
+                                    new_frontier.append(new_path)
+                        frontier = new_frontier
+        
+
+        self.connection.commit()
+
+def prompt_list(msg: str):
+    raw = input(msg).strip()
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+def main():
+    db = BudgetDatabase()
+    try:
+        db.ensure_schema()
+        # 1) Ensure at least one user
+        users = db.get_all_users()
+        if not users:
+            print("No users found. Let's create your first user.")
+            username = input("Username: ").strip()
+            display = input("Display name (optional): ").strip()
+            db.create_user(username, display or None)
+            users = db.get_all_users()
+
+        print("Current users:")
+        for u in users:
+            print(f" - {u['username']} ({u['display_name'] or ''})")
+
+        usernames = [u['username'] for u in users]
+
+        # 2) Build per-user Level-2 branches
+        l2_by_user = {}
+        for user in usernames:
+            l2_by_user[user] = {}
+            for t in ["asset", "liability", "expense", "income"]:
+                raw = input(f"Level-2 branches for {t} for user {user} (comma-separated): ").strip()
+                if raw:
+                    l2_by_user[user][t] = [s.strip() for s in raw.split(",") if s.strip()]
+
+        # If no L2s provided for any user, exit gracefully
+        if not any(l2_by_user[u] for u in usernames):
+            print("No Level-2 branches provided. Exiting bootstrap.")
+            return
+
+        # 3) Level-3 branches (single set, applied to all L2 paths)
+        l3_raw = input("Enter Level-3 branches to apply to all Level-2 nodes (comma-separated): ").strip()
+        l3_branches = []
+
+        # 4) Seed hierarchy
+        db.seed_hierarchy(usernames, l2_by_user, l3_branches)
+
+        # 5) Summary
+        print("Seed complete. Tree created under:")
+        for user in usernames:
+            for t, l2s in (l2_by_user.get(user, {})).items():
+                for l2 in l2s:
+                    base = f"{t}.{user}.{l2}"
+                    print("  -", base)
+                    for l3 in l3_branches:
+                        print("    -", f"{base}.{l3}")
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    main()
